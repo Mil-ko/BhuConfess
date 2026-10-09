@@ -1,6 +1,7 @@
 // src/services/channel.service.js
 const logger = require('../utils/logger');
-const { CHANNEL_POST_TEMPLATE } = require('../utils/constants');
+const { CHANNEL_POST_TEMPLATE, TOPICS } = require('../utils/constants');
+const keyboards = require('../utils/keyboards');
 
 class ChannelService {
     constructor() {
@@ -9,8 +10,10 @@ class ChannelService {
     }
 
     // Set bot instance
-    setBot(bot) {
-        this.bot = bot;
+    setBot(telegramApi) {
+        // `telegramApi` is the Telegram API client (ctx.telegram): it has
+        // sendMessage / getChat / getMe directly.
+        this.bot = telegramApi;
     }
 
     // Update channel ID
@@ -22,6 +25,7 @@ class ChannelService {
 
     // Post confession to channel
     async postToChannel(confession, botUsername) {
+        this.botUsername = botUsername;
         try {
             if (!this.bot) {
                 throw new Error('Bot not initialized');
@@ -35,12 +39,14 @@ class ChannelService {
             const message = this.formatConfession(confession, botUsername);
 
             // Post to channel
-            const result = await this.bot.telegram.sendMessage(
+            const result = await this.bot.sendMessage(
                 this.channelId,
                 message,
                 {
-                    parse_mode: 'Markdown',
-                    disable_web_page_preview: true
+                    // Plain text: the v1 template has no Markdown styling and
+                    // user text must never go through an entity parser.
+                    disable_web_page_preview: true,
+                    reply_markup: keyboards.channelPost(confession._id, botUsername)
                 }
             );
 
@@ -77,31 +83,50 @@ class ChannelService {
         }
     }
 
-    // Format confession for channel
-    formatConfession(confession, botUsername) {
-        // Clean the text (remove any markdown that could break formatting)
-        const cleanText = confession.text
-            .replace(/_/g, '\\_')
-            .replace(/\*/g, '\\*')
-            .replace(/\[/g, '\\[')
-            .replace(/\]/g, '\\]')
-            .replace(/\(/g, '\\(')
-            .replace(/\)/g, '\\)')
-            .replace(/~/g, '\\~')
-            .replace(/`/g, '\\`')
-            .replace(/>/g, '\\>')
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;');
+    // Refresh the comment count shown beside the Browse Comments button on
+    // an already-published channel post. Never throws (deleted posts etc.).
+    async updateCommentCount(confessionId, channelPostId, count) {
+        if (!this.bot || !this.channelId || !channelPostId) {
+            return false;
+        }
+        try {
+            if (!this.botUsername) {
+                const me = await this.bot.getMe();
+                this.botUsername = me.username;
+            }
+            const markup = keyboards.channelPost(confessionId, this.botUsername, count);
+            await this.bot.editMessageReplyMarkup(
+                this.channelId,
+                Number(channelPostId),
+                undefined,
+                markup
+            );
+            logger.info(`🔢 Comment count on channel post ${channelPostId} → ${count}`);
+            return true;
+        } catch (error) {
+            // Channel post deleted or bot lost access - not fatal
+            logger.warn(`Could not update comment count: ${error.message}`);
+            return false;
+        }
+    }
 
-        // Generate a short ID for the confession (last 6 chars of ObjectId)
-        const shortId = confession._id.toString().slice(-6);
+    // Format confession for channel (plain text - no parse_mode)
+    formatConfession(confession, botUsername) {
+        const topicLabel = TOPICS[confession.topic]
+            ? TOPICS[confession.topic].label
+            : '💬 Other';
+
+        // Public header: nickname when we have one, otherwise anonymous
+        const header = confession.nickname
+            ? `💭 Confession from ${confession.nickname}`
+            : '💭 Anonymous Confession';
 
         // Replace template variables
         return CHANNEL_POST_TEMPLATE
-            .replace('{text}', cleanText)
-            .replace('{bot_username}', botUsername.replace('@', ''))
-            .replace('{id}', shortId);
+            .replace('{header}', header)
+            .replace('{topic}', topicLabel)
+            .replace('{text}', confession.text)
+            .replace('{bot_username}', botUsername.replace('@', ''));
     }
 
     // Preview how confession will look
@@ -129,12 +154,12 @@ class ChannelService {
             }
 
             // Try to get chat info
-            const chat = await this.bot.telegram.getChat(this.channelId);
+            const chat = await this.bot.getChat(this.channelId);
             
             // Try to get bot's permissions
-            const botMember = await this.bot.telegram.getChatMember(
+            const botMember = await this.bot.getChatMember(
                 this.channelId, 
-                (await this.bot.telegram.getMe()).id
+                (await this.bot.getMe()).id
             );
 
             const canPost = botMember.status === 'administrator' || 

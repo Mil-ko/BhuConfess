@@ -25,7 +25,7 @@ class DatabaseConnection {
             const options = {
                 autoIndex: true, // Build indexes
                 maxPoolSize: 10, // Maintain up to 10 socket connections
-                serverSelectionTimeoutMS: 5000, // Keep trying to send operations for 5 seconds
+                serverSelectionTimeoutMS: 15000, // Keep trying to send operations for 15 seconds
                 socketTimeoutMS: 45000, // Close sockets after 45 seconds of inactivity
                 family: 4, // Use IPv4, skip trying IPv6
                 retryWrites: true,
@@ -34,8 +34,24 @@ class DatabaseConnection {
 
             logger.info('Connecting to MongoDB Atlas...');
 
-            // Connect to MongoDB
-            this.connection = await mongoose.connect(MONGODB_URI, options);
+            // Connect to MongoDB (retry: Atlas/network can be slow to answer)
+            let lastError = null;
+            for (let attempt = 1; attempt <= 3; attempt++) {
+                try {
+                    this.connection = await mongoose.connect(MONGODB_URI, options);
+                    lastError = null;
+                    break;
+                } catch (error) {
+                    lastError = error;
+                    logger.warn(`MongoDB connect attempt ${attempt}/3 failed: ${error.message}`);
+                    if (attempt < 3) {
+                        await new Promise(resolve => setTimeout(resolve, 2000));
+                    }
+                }
+            }
+            if (lastError) {
+                throw lastError;
+            }
             
             this.isConnected = true;
             

@@ -1,5 +1,6 @@
 // src/utils/validator.js
 const logger = require('./logger');
+const { NICKNAME } = require('./constants');
 
 class Validator {
     // Sanitize and validate confession text
@@ -55,6 +56,54 @@ class Validator {
                 isValid: false,
                 error: 'Error validating confession'
             };
+        }
+    }
+
+    // Validate a nickname (2-20 chars, single line, printable)
+    validateNickname(text) {
+        try {
+            if (!text || typeof text !== 'string') {
+                return { isValid: false, error: 'Nickname cannot be empty' };
+            }
+
+            // Remove control characters and collapse whitespace
+            let cleaned = text.replace(/[\u0000-\u001f\u007f]/g, '').trim().replace(/\s+/g, ' ');
+
+            if (cleaned.length < NICKNAME.MIN) {
+                return { isValid: false, error: `Nickname must be at least ${NICKNAME.MIN} characters` };
+            }
+            if (cleaned.length > NICKNAME.MAX) {
+                return { isValid: false, error: `Nickname must be at most ${NICKNAME.MAX} characters` };
+            }
+
+            return { isValid: true, cleaned };
+        } catch (error) {
+            logger.error('Nickname validation error:', error);
+            return { isValid: false, error: 'Error validating nickname' };
+        }
+    }
+
+    // Validate comment / reply text (plain text, 1-1000 chars)
+    validateComment(text) {
+        try {
+            if (!text || typeof text !== 'string') {
+                return { isValid: false, error: 'Comment cannot be empty' };
+            }
+
+            const cleaned = text.trim().replace(/\n{3,}/g, '\n\n');
+
+            if (cleaned.length < 1) {
+                return { isValid: false, error: 'Comment cannot be empty' };
+            }
+
+            if (cleaned.length > 1000) {
+                return { isValid: false, error: 'Comment is too long (maximum 1000 characters)' };
+            }
+
+            return { isValid: true, cleaned, length: cleaned.length };
+        } catch (error) {
+            logger.error('Comment validation error:', error);
+            return { isValid: false, error: 'Error validating comment' };
         }
     }
 

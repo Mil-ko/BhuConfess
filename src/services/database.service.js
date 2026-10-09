@@ -1,5 +1,10 @@
 // src/services/database.service.js
 const Confession = require('../models/Confession.model');
+const Comment = require('../models/Comment.model');
+const User = require('../models/User.model');
+const { NICKNAME } = require('../utils/constants');
+
+const NICKNAME_COOLDOWN_MS = NICKNAME.CHANGE_COOLDOWN_DAYS * 24 * 60 * 60 * 1000;
 const databaseConnection = require('../config/database');
 const logger = require('../utils/logger');
 const { STATUS } = require('../utils/constants');
@@ -23,6 +28,9 @@ class DatabaseService {
             // Create new confession document
             const confession = new Confession({
                 text: confessionData.text,
+                topic: confessionData.topic || 'other',
+                authorId: confessionData.authorId || null,
+                nickname: confessionData.nickname || null,
                 metadata: {
                     hasLinks: confessionData.metadata?.hasLinks || false,
                     messageLength: confessionData.text.length,
@@ -63,7 +71,8 @@ class DatabaseService {
     }
 
     // Get confession by ID
-    async getConfessionById(id) {
+    // includeAuthor: also return the authorId (for decision notifications)
+    async getConfessionById(id, includeAuthor = false) {
         try {
             if (!databaseConnection.isConnected) {
                 await this.initialize();
@@ -80,7 +89,9 @@ class DatabaseService {
 
             return {
                 success: true,
-                confession: confession.toSafeObject()
+                confession: includeAuthor
+                    ? confession.toAdminObject()
+                    : confession.toSafeObject()
             };
 
         } catch (error) {
@@ -536,6 +547,178 @@ class DatabaseService {
                 success: false,
                 error: 'Failed to fetch confession'
             };
+        }
+    }
+    // ── Comments (only ever shown inside the bot, never posted) ──────
+
+    // Create a comment or a one-level reply
+    async createComment({ confessionId, authorId, nickname = null, text, parentCommentId = null }) {
+        try {
+            if (!databaseConnection.isConnected) {
+                await this.initialize();
+            }
+
+            const comment = new Comment({
+                confessionId,
+                authorId: authorId || null,
+                nickname: nickname || null,
+                text,
+                parentCommentId: parentCommentId || null
+            });
+
+            const saved = await comment.save();
+            logger.info(`💬 Comment saved for confession ${confessionId}`);
+
+            return { success: true, comment: saved.toSafeObject() };
+        } catch (error) {
+            logger.error('Error saving comment:', error);
+            if (error.name === 'ValidationError') {
+                const errors = Object.values(error.errors).map(e => e.message);
+                return { success: false, error: errors.join(', ') };
+            }
+            return { success: false, error: 'Failed to save comment' };
+        }
+    }
+
+    // All comments for a confession, oldest first (pagination happens above)
+    async getComments(confessionId) {
+        try {
+            if (!databaseConnection.isConnected) {
+                await this.initialize();
+            }
+
+            const comments = await Comment.find({ confessionId })
+                .sort({ createdAt: 1 })
+                .limit(500);
+
+            return { success: true, comments: comments.map(c => c.toSafeObject()) };
+        } catch (error) {
+            logger.error('Error fetching comments:', error);
+            return { success: false, error: 'Failed to fetch comments' };
+        }
+    }
+
+    // Single comment (needed to resolve reply targets)
+    // includeAuthor: also return authorId (for reply notifications)
+    async getCommentById(id, includeAuthor = false) {
+        try {
+            if (!databaseConnection.isConnected) {
+                await this.initialize();
+            }
+
+            const comment = await Comment.findById(id);
+            if (!comment) {
+                return { success: false, error: 'Comment not found' };
+            }
+            if (includeAuthor) {
+                const obj = comment.toObject();
+                delete obj.__v;
+                return { success: true, comment: obj };
+            }
+            return { success: true, comment: comment.toSafeObject() };
+        } catch (error) {
+            logger.error('Error fetching comment:', error);
+            if (error.name === 'CastError') {
+                return { success: false, error: 'Invalid comment ID' };
+            }
+            return { success: false, error: 'Failed to fetch comment' };
+        }
+    }
+
+    // ── Profile stats ───────────────────────────────────────────────────
+
+    // ── Nicknames ───────────────────────────────────────────────
+
+    // { nickname, canChange, retryAt }
+    async getNicknameState(telegramId) {
+        try {
+            if (!databaseConnection.isConnected) {
+                await this.initialize();
+            }
+
+            const user = await User.findOne({ telegramId: String(telegramId) });
+            if (!user || !user.nickname) {
+                return { nickname: null, canChange: true, retryAt: null };
+            }
+
+            if (!user.nicknameChangedAt) {
+                // First set never started a cooldown - a change is allowed now
+                return { nickname: user.nickname, canChange: true, retryAt: null };
+            }
+
+            const elapsed = Date.now() - user.nicknameChangedAt.getTime();
+            if (elapsed >= NICKNAME_COOLDOWN_MS) {
+                return { nickname: user.nickname, canChange: true, retryAt: null };
+            }
+
+            return {
+                nickname: user.nickname,
+                canChange: false,
+                retryAt: new Date(user.nicknameChangedAt.getTime() + NICKNAME_COOLDOWN_MS)
+            };
+        } catch (error) {
+            logger.error('Error getting nickname state:', error);
+            return { nickname: null, canChange: false, retryAt: null };
+        }
+    }
+
+    async getNickname(telegramId) {
+        const state = await this.getNicknameState(telegramId);
+        return state.nickname;
+    }
+
+    // Save a nickname, enforcing the change cooldown.
+    // First-ever save is free; every later change starts a 14-day cooldown.
+    // → { success, nickname } or { success:false, error, retryAt }
+    async setNickname(telegramId, nickname) {
+        try {
+            if (!databaseConnection.isConnected) {
+                await this.initialize();
+            }
+
+            const id = String(telegramId);
+            const state = await this.getNicknameState(id);
+
+            if (state.nickname && !state.canChange) {
+                return { success: false, error: 'cooldown', retryAt: state.retryAt };
+            }
+
+            const isFirstSet = !state.nickname;
+            const update = { nickname };
+            if (!isFirstSet) {
+                update.nicknameChangedAt = new Date(); // start the cooldown
+            }
+
+            const user = await User.findOneAndUpdate(
+                { telegramId: id },
+                { $set: update },
+                { upsert: true, new: true, setDefaultsOnInsert: true }
+            );
+
+            logger.info(`📛 Nickname ${isFirstSet ? 'set' : 'changed'} for ${id}`);
+            return { success: true, nickname: user.nickname };
+        } catch (error) {
+            logger.error('Error setting nickname:', error);
+            return { success: false, error: 'save failed' };
+        }
+    }
+
+    async getAuthorStats(authorId) {
+        try {
+            if (!databaseConnection.isConnected) {
+                await this.initialize();
+            }
+
+            const submitted = await Confession.countDocuments({ authorId: String(authorId) });
+            const approved = await Confession.countDocuments({
+                authorId: String(authorId),
+                status: STATUS.APPROVED
+            });
+
+            return { success: true, submitted, approved };
+        } catch (error) {
+            logger.error('Error getting author stats:', error);
+            return { success: false, error: 'Failed to get stats' };
         }
     }
 }

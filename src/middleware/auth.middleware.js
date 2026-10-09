@@ -4,14 +4,23 @@ const logger = require('../utils/logger');
 
 class AuthMiddleware {
     constructor() {
-        this.adminId = process.env.ADMIN_ID;
+        // Comma-separated list of admin Telegram IDs
+        this.adminIds = String(process.env.ADMIN_ID || '')
+            .split(',')
+            .map(s => s.trim())
+            .filter(Boolean);
     }
+
+    // Server-side admin check used by commands AND callback buttons
+    isAdminId = (userId) => {
+        return this.adminIds.includes(String(userId));
+    };
 
     // Check if user is admin (for bot commands)
     isAdmin = (ctx, next) => {
         try {
             const userId = ctx.from?.id?.toString();
-            const isAdmin = userId === this.adminId;
+            const isAdmin = this.isAdminId(userId);
 
             if (!isAdmin) {
                 logger.warn(`Unauthorized admin access attempt by user ${userId}`);

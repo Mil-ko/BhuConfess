@@ -3,9 +3,10 @@ const { Telegraf, session } = require('telegraf');
 const botController = require('../controllers/bot.controller');
 const adminController = require('../controllers/admin.controller');
 const authMiddleware = require('../middleware/auth.middleware');
-const databaseService = require('./database.service');
-const { STATUS } = require('../utils/constants');
+const { COMMANDS, MESSAGES } = require('../utils/constants');
 const logger = require('../utils/logger');
+
+const ID_RE = /^[0-9a-f]{24}$/i;
 
 class TelegramService {
     constructor() {
@@ -19,155 +20,174 @@ class TelegramService {
         }
 
         this.bot = new Telegraf(token);
-        
-        // Use session middleware
-        this.bot.use(session());
-        
-        // Add rate limiting middleware
-        this.bot.use(authMiddleware.checkBotRateLimit.bind(authMiddleware));
-        
+
+        // One session per USER (not per chat): a comment flow can start from
+        // a button on a channel post and continue in the bot's private chat.
+        this.bot.use(session({
+            getSessionKey: (ctx) => (ctx.from ? String(ctx.from.id) : undefined)
+        }));
+
         this.setupHandlers();
         return this.bot;
     }
 
-    // Setup all bot command and message handlers
+    // Setup all bot command, callback and message handlers
     setupHandlers() {
         if (!this.bot) return;
+        const bot = this.bot;
 
-        // Public command handlers
-        this.bot.start(botController.handleStart.bind(botController));
-        this.bot.help(botController.handleHelp.bind(botController));
-        this.bot.command('privacy', botController.handlePrivacy.bind(botController));
-        this.bot.command('about', botController.handleAbout.bind(botController));
-        this.bot.command('status', botController.handleStatus.bind(botController));
+        // ── Public commands ────────────────────────────────────
+        bot.start((ctx) => botController.handleStart(ctx));
+        bot.help((ctx) => botController.handleHelp(ctx));
+        bot.command('privacy', (ctx) => botController.handlePrivacy(ctx));
+        bot.command('about', (ctx) => botController.handleAbout(ctx));
+        bot.command('status', (ctx) => botController.handleStatus(ctx));
 
-        // Admin commands
-        this.bot.command('pending', authMiddleware.isAdmin, adminController.viewPending.bind(adminController));
-        this.bot.command('stats', authMiddleware.isAdmin, adminController.getStats.bind(adminController));
-        this.bot.command('list', authMiddleware.isAdmin, adminController.listConfessions.bind(adminController));
-        this.bot.command('adminhelp', authMiddleware.isAdmin, adminController.adminHelp.bind(adminController));
-        this.bot.command('approve', authMiddleware.isAdmin, this.handleApproveCommand.bind(this));
-        this.bot.command('reject', authMiddleware.isAdmin, this.handleRejectCommand.bind(this));
-        this.bot.command('view', authMiddleware.isAdmin, this.handleViewCommand.bind(this));
+        // ── Admin commands (permission checked in the middleware) ──
+        bot.command('pending', authMiddleware.isAdmin, (ctx) => adminController.viewPending(ctx));
+        bot.command('stats', authMiddleware.isAdmin, (ctx) => adminController.getStats(ctx));
+        bot.command('setchannel', authMiddleware.isAdmin, (ctx) => adminController.setChannel(ctx));
+        bot.command('post', authMiddleware.isAdmin, (ctx) => adminController.postCommand(ctx));
+        bot.command('adminhelp', authMiddleware.isAdmin, (ctx) => adminController.adminHelp(ctx));
 
-        // Channel commands
-        this.bot.command('setchannel', authMiddleware.isAdmin, adminController.setChannel.bind(adminController));
-        this.bot.command('post', authMiddleware.isAdmin, adminController.postToChannel.bind(adminController));
-        this.bot.command('preview', authMiddleware.isAdmin, adminController.previewChannelPost.bind(adminController));
-        this.bot.command('channelstatus', authMiddleware.isAdmin, adminController.channelStatus.bind(adminController));
+        // ── Central callback router (all inline buttons) ───────
+        bot.on('callback_query', (ctx) => this.routeCallback(ctx));
 
-        // Handle callback queries
-        this.bot.on('callback_query', authMiddleware.isAdmin, adminController.handleCallback.bind(adminController));
-        // Handle text messages
-        this.bot.on('text', async (ctx, next) => {
-            // First: handle confirmation replies
-            if (ctx.session && ctx.session.waitingForConfirmation) {
-                await adminController.handleConfirmation(ctx);
-            } else if (ctx.session && ctx.session.pendingRejection) {
-                await adminController.handleRejectionReason(ctx);
-            } else {
-                // Regular confession
-                await botController.handleMessage(ctx);
-            }
-            return next();
+        // ── Text messages → flow state machine (rate limited) ──
+        bot.on('text', (ctx, next) =>
+            authMiddleware.checkBotRateLimit(ctx, () => botController.handleText(ctx)));
+
+        // ── Errors ─────────────────────────────────────────────
+        bot.catch((error, ctx) => {
+            logger.error(`Bot error on ${ctx.updateType}:`, error);
         });
-
-        // Handle errors
-        this.bot.catch(botController.handleError.bind(botController));
 
         logger.info('Bot handlers configured');
     }
 
-    // Handle approve command with ID
-    async handleApproveCommand(ctx) {
+    // Route every inline-button press by its callback-data prefix.
+    // Callback data format: <prefix>_<action>_<id>[_<page>]
+    async routeCallback(ctx) {
+        const data = ctx.callbackQuery && ctx.callbackQuery.data;
+        if (!data) return;
+
         try {
-            const args = ctx.message.text.split(' ');
-            if (args.length < 2) {
-                await ctx.reply('Please provide a confession ID. Usage: /approve [confession_id]');
-                return;
-            }
+            const parts = String(data).split('_');
+            const prefix = parts[0];
 
-            const confessionId = args[1];
-            await adminController.approveConfession(ctx, confessionId);
-        } catch (error) {
-            logger.error('Error in approve command:', error);
-            await ctx.reply('Error processing approve command');
-        }
-    }
-
-    // Handle reject command with ID
-    async handleRejectCommand(ctx) {
-        try {
-            const args = ctx.message.text.split(' ');
-            if (args.length < 2) {
-                await ctx.reply('Please provide a confession ID. Usage: /reject [confession_id]');
-                return;
-            }
-
-            const confessionId = args[1];
-            const reason = args.slice(2).join(' ') || null;
-            
-            if (reason) {
-                // Direct rejection with reason
-                const adminId = ctx.from.id.toString();
-                const updateResult = await databaseService.updateConfessionStatus(
-                    confessionId,
-                    STATUS.REJECTED,
-                    adminId,
-                    reason
-                );
-
-                if (updateResult.success) {
-                    await ctx.replyWithMarkdown(`❌ Confession rejected.\nReason: ${reason}`);
-                } else {
-                    await ctx.reply('Failed to reject confession');
+            // Admin decisions - permission checked SERVER SIDE every time
+            if (prefix === 'ad') {
+                if (!authMiddleware.isAdminId(ctx.from.id)) {
+                    logger.warn(`Unauthorized admin callback by ${ctx.from.id}: ${data}`);
+                    await this._answer(ctx, MESSAGES.ADMIN.NOT_ADMIN);
+                    return;
                 }
-            } else {
-                // Use callback flow for reason
-                ctx.session = ctx.session || {};
-                ctx.session.pendingRejection = confessionId;
-                await ctx.reply('Please provide a reason for rejection:');
-            }
-        } catch (error) {
-            logger.error('Error in reject command:', error);
-            await ctx.reply('Error processing reject command');
-        }
-    }
-
-    // Handle view command
-    async handleViewCommand(ctx) {
-        try {
-            const args = ctx.message.text.split(' ');
-            if (args.length < 2) {
-                await ctx.reply('Please provide a confession ID. Usage: /view [confession_id]');
+                const action = parts[1];
+                const id = parts[2];
+                if (!id || !ID_RE.test(id)) {
+                    await this._answer(ctx, MESSAGES.ADMIN.INVALID_ID);
+                    return;
+                }
+                await adminController.handleDecision(ctx, id, action === 'ok');
                 return;
             }
 
-            const confessionId = args[1];
-            await adminController.viewFullConfession(ctx, confessionId);
+            switch (prefix) {
+                // Menu / info
+                case 'm': {
+                    const action = parts[1];
+                    if (action === 'menu') return botController.showMenu(ctx);
+                    if (action === 'help') return botController.showHelp(ctx);
+                    if (action === 'profile') return botController.showProfile(ctx);
+                    if (action === 'nick') return botController.startNicknameChange(ctx);
+                    break;
+                }
+
+                // Confession flow
+                case 'c': {
+                    const action = parts[1];
+                    switch (action) {
+                        case 'start': return botController.startConfession(ctx);
+                        case 'topic': return botController.chooseTopic(ctx, parts[2]);
+                        case 'edit': return botController.editConfession(ctx);
+                        case 'submit': return botController.submitConfession(ctx);
+                        case 'cancel': return botController.cancelConfession(ctx);
+                    }
+                    break;
+                }
+
+                // Browse comments: cb_<confessionId>_<page>
+                case 'cb': {
+                    if (!parts[1] || !ID_RE.test(parts[1])) {
+                        await this._answer(ctx, MESSAGES.CONFESSION_NOT_FOUND);
+                        return;
+                    }
+                    return botController.browseComments(ctx, parts[1], parts[2]);
+                }
+
+                // Comment actions: cn_<action>_<id>
+                case 'cn': {
+                    const action = parts[1];
+                    const id = parts[2];
+                    if (!id || !ID_RE.test(id)) {
+                        await this._answer(ctx, MESSAGES.CONFESSION_NOT_FOUND);
+                        return;
+                    }
+                    switch (action) {
+                        case 'new': return botController.startComment(ctx, id);
+                        case 'sub': return botController.submitComment(ctx, id);
+                        case 'can': return botController.cancelComment(ctx, id);
+                        case 'rep': return botController.startReply(ctx, id);
+                        case 'rsub': return botController.submitReply(ctx, id);
+                        case 'rcan': return botController.cancelReply(ctx, id);
+                    }
+                    break;
+                }
+            }
+
+            logger.warn(`Unknown callback data: ${data}`);
+            await this._answer(ctx, 'Unknown action');
         } catch (error) {
-            logger.error('Error in view command:', error);
-            await ctx.reply('Error processing view command');
+            logger.error('Error routing callback:', error);
+            await this._answer(ctx, MESSAGES.ERROR);
+        }
+    }
+
+    async _answer(ctx, text) {
+        if (!ctx.callbackQuery) return;
+        try {
+            await ctx.answerCbQuery(text);
+        } catch (e) {
+            // expired or already answered
         }
     }
 
     // Launch the bot
     async launch() {
         try {
-            await this.bot.launch();
-            logger.info('🤖 Bot launched successfully');
-            
-            // Get bot info
-            const botInfo = await this.bot.telegram.getMe();
-            logger.info(`📱 Bot Info: @${botInfo.username} (ID: ${botInfo.id})`);
-            
-            // Log admin status
-            if (process.env.ADMIN_ID) {
-                logger.info(`👮 Admin ID configured: ${process.env.ADMIN_ID}`);
-            } else {
-                logger.warn('⚠️ No ADMIN_ID configured - admin commands will not work');
+            // Register the command list shown in Telegram's UI
+            try {
+                await this.bot.telegram.setMyCommands(COMMANDS);
+            } catch (error) {
+                logger.warn(`setMyCommands failed: ${error.message}`);
             }
-            
+
+            // NOTE: in Telegraf 4, launch() only resolves after the bot
+            // stops - so all "launched" logging happens in the onLaunch
+            // callback, which fires right after getMe succeeds.
+            const onLaunch = () => {
+                const botInfo = this.bot.botInfo;
+                logger.info('🤖 Bot launched successfully (long polling)');
+                logger.info(`📱 Bot Info: @${botInfo.username} (ID: ${botInfo.id})`);
+
+                if (authMiddleware.adminIds.length) {
+                    logger.info(`👮 Admin IDs configured: ${authMiddleware.adminIds.join(', ')}`);
+                } else {
+                    logger.warn('⚠️ No ADMIN_ID configured - admin commands will not work');
+                }
+            };
+
+            await this.bot.launch({}, onLaunch);
             return true;
         } catch (error) {
             logger.error('Failed to launch bot:', error);

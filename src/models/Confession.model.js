@@ -21,6 +21,30 @@ const confessionSchema = new mongoose.Schema({
         index: true // Add index for faster queries
     },
 
+    // Topic chosen by the author during the flow
+    topic: {
+        type: String,
+        default: 'other',
+        index: true
+    },
+
+    // Telegram ID of the author - stored SEPARATELY from the confession
+    // content and never shown to admins or published. Used only to send
+    // the approve/reject notification and to count profile stats.
+    authorId: {
+        type: String,
+        default: null,
+        index: true
+    },
+
+    // Public nickname snapshot taken at submission time (later nickname
+    // changes do not rewrite already-published confessions).
+    // null → published as "Anonymous Confession".
+    nickname: {
+        type: String,
+        default: null
+    },
+
     // Metadata (completely anonymous - no user IDs)
     metadata: {
         hasLinks: {
@@ -87,10 +111,19 @@ confessionSchema.virtual('formattedDate').get(function() {
 });
 
 // Method to safely return confession data (without internal fields)
+// authorId is stripped too - nothing public may expose the author.
 confessionSchema.methods.toSafeObject = function() {
     const obj = this.toObject();
     delete obj.__v;
     delete obj.adminAction;
+    delete obj.authorId;
+    return obj;
+};
+
+// Raw view for admin logic (notifications need authorId, display never does)
+confessionSchema.methods.toAdminObject = function() {
+    const obj = this.toObject();
+    delete obj.__v;
     return obj;
 };
 
@@ -116,18 +149,17 @@ confessionSchema.statics.findPosted = function(limit = 20) {
 };
 
 // Pre-save middleware to ensure data quality
-confessionSchema.pre('save', function(next) {
+// Note: Mongoose 9 no longer passes `next` to middleware - just do the work.
+confessionSchema.pre('save', function() {
     // Ensure text is properly trimmed
     if (this.text) {
         this.text = this.text.trim();
     }
     
     // Update metadata if not set
-    if (!this.metadata.messageLength) {
+    if (this.metadata && !this.metadata.messageLength) {
         this.metadata.messageLength = this.text.length;
     }
-    
-    next();
 });
 
 // Create the model
