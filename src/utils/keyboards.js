@@ -82,6 +82,17 @@ const keyboards = {
         };
     },
 
+    // Approval notification sent privately to the author.
+    // A plain URL button (no callback_data): it opens the post on the channel
+    // so the author can find their confession without scrolling the feed.
+    publishedNotice(channelUrl) {
+        return {
+            inline_keyboard: [
+                [{ text: '📢 View on Channel', url: channelUrl }]
+            ]
+        };
+    },
+
     // Comments browser page.
     // threads: [{ comment, replies: [] }] for this page
     commentsPage(confessionId, page, pages, threads) {

@@ -75,15 +75,24 @@ class AdminController {
 
             // Approve → publish to the channel (reject → nothing goes out)
             let resultText;
+            let channelPostId = null;
             if (approve) {
-                resultText = await this.publishToChannel(ctx, confessionId, update.confession);
+                const published = await this.publishToChannel(ctx, confessionId, update.confession);
+                resultText = published.text;
+                channelPostId = published.messageId;
             } else {
                 resultText = MESSAGES.ADMIN.REVIEW_DONE_REJECTED;
             }
 
             // Notify the AUTHOR (and only the author) of the decision.
+            // On approval, attach a button straight to the published post.
             const notification = approve ? MESSAGES.NOTIFY_APPROVED : MESSAGES.NOTIFY_REJECTED;
-            await this.notifyAuthor(ctx, confession.authorId, notification);
+            let linkMarkup = null;
+            if (channelPostId) {
+                const postUrl = await channelService.getPostUrl(channelPostId);
+                if (postUrl) linkMarkup = keyboards.publishedNotice(postUrl);
+            }
+            await this.notifyAuthor(ctx, confession.authorId, notification, linkMarkup);
 
             // Update the review message in the admin chat (buttons disappear)
             try {
@@ -100,7 +109,8 @@ class AdminController {
     }
 
     // Publish an approved confession to the channel.
-    // Returns the status text for the admin review message.
+    // Returns { text, messageId } - text for the admin review message,
+    // messageId so the author can be linked to the post (null if it failed).
     async publishToChannel(ctx, confessionId, confession) {
         try {
             channelService.setBot(ctx.telegram);
@@ -108,30 +118,36 @@ class AdminController {
             const post = await channelService.postToChannel(confession, botInfo.username);
 
             if (!post.success) {
-                return MESSAGES.ADMIN.REVIEW_DONE_APPROVED_NO_CHANNEL
-                    .replace('{error}', post.error)
-                    .replace('{id}', confessionId);
+                return {
+                    messageId: null,
+                    text: MESSAGES.ADMIN.REVIEW_DONE_APPROVED_NO_CHANNEL
+                        .replace('{error}', post.error)
+                        .replace('{id}', confessionId)
+                };
             }
 
             await databaseService.updateChannelPostInfo(confessionId, post.messageId, post.date);
-            return MESSAGES.ADMIN.REVIEW_DONE_APPROVED;
+            return { messageId: post.messageId, text: MESSAGES.ADMIN.REVIEW_DONE_APPROVED };
         } catch (error) {
             logger.error('Error publishing to channel:', error);
-            return MESSAGES.ADMIN.REVIEW_DONE_APPROVED_NO_CHANNEL
-                .replace('{error}', error.message)
-                .replace('{id}', confessionId);
+            return {
+                messageId: null,
+                text: MESSAGES.ADMIN.REVIEW_DONE_APPROVED_NO_CHANNEL
+                    .replace('{error}', error.message)
+                    .replace('{id}', confessionId)
+            };
         }
     }
 
     // Private notification to the author. Never throws - a user who never
-    // pressed /start simply cannot be reached.
-    async notifyAuthor(ctx, authorId, text) {
+    // pressed /start simply cannot be reached. markup is optional.
+    async notifyAuthor(ctx, authorId, text, markup = null) {
         if (!authorId) {
             logger.warn(MESSAGES.NOTIFY_FAILED);
             return false;
         }
         try {
-            await ctx.telegram.sendMessage(authorId, text);
+            await ctx.telegram.sendMessage(authorId, text, markup ? { reply_markup: markup } : undefined);
             return true;
         } catch (error) {
             logger.warn(`Could not notify author ${authorId}: ${error.message}`);
@@ -208,8 +224,8 @@ class AdminController {
                 return;
             }
 
-            const text = await this.publishToChannel(ctx, confessionId, result.confession);
-            await ctx.reply(text);
+            const published = await this.publishToChannel(ctx, confessionId, result.confession);
+            await ctx.reply(published.text);
         } catch (error) {
             logger.error('Error in postCommand:', error);
             await ctx.reply('❌ Error posting to channel');

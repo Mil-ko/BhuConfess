@@ -16,6 +16,7 @@ const botController = require('../src/controllers/bot.controller');
 const adminController = require('../src/controllers/admin.controller');
 const databaseService = require('../src/services/database.service');
 const authMiddleware = require('../src/middleware/auth.middleware');
+const channelService = require('../src/services/channel.services.js');
 const Comment = require('../src/models/Comment.model');
 const Confession = require('../src/models/Confession.model');
 const User = require('../src/models/User.model');
@@ -221,7 +222,23 @@ function ok(label) { passed++; console.log('  ✅ ' + label); }
 
         const notify = ctx.log.sent.find(m => String(m.chatId) === String(ALICE.id));
         assert(notify && notify.text.includes('approved'), 'author notified of approval');
-        ok('author receives private approval notification');
+
+        // …with a button straight to the published post
+        const expectedUrl = `https://t.me/testchannel/${doc.channelPostId}`;
+        const viewBtn = notify.extra && notify.extra.reply_markup
+            ? notify.extra.reply_markup.inline_keyboard.flat()[0]
+            : null;
+        assert(viewBtn && viewBtn.url === expectedUrl,
+            `approval DM links to the channel post (got ${viewBtn && viewBtn.url})`);
+        ok('author receives private approval notification with a View on Channel button');
+
+        // Private channel (no public @username) → no button at all, never a
+        // dead t.me link.
+        channelService.channelUsername = null;
+        assert.strictEqual(await channelService.getPostUrl(doc.channelPostId), null,
+            'no t.me link for a channel without a username');
+        channelService.channelUsername = undefined;
+        ok('channel without a public username → no post button');
 
         assert(ctx.log.edits.length === 1 && ctx.log.edits[0].includes('published'),
             'admin review message updated');
@@ -252,6 +269,8 @@ function ok(label) { passed++; console.log('  ✅ ' + label); }
         assert.strictEqual(doc.status, 'rejected', 'status rejected');
         const rejectNote = ctx.log.sent.filter(m => String(m.chatId) === String(ALICE.id)).pop();
         assert(rejectNote.text.includes('not approved'), 'author notified of rejection');
+        assert(!rejectNote.extra || !rejectNote.extra.reply_markup,
+            'no channel button on a rejection (nothing was published)');
         assert(!ctx.log.sent.some(m => String(m.chatId).startsWith('-')), 'nothing sent to a channel');
         ok('reject → author notified, nothing posted to channel');
 

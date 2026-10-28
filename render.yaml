@@ -1,0 +1,32 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+#
+# Deploy: push this repo, then on Render choose
+#   New + → Blueprint → pick the repository.
+# Render reads this file and creates the service below. Values marked
+# `sync: false` are secrets: Render asks you for them in the dashboard and
+# never reads them from the repo.
+services:
+  - type: web
+    name: anonymous-confessions-bot
+    runtime: node
+    # `free` spins down after 15 min without inbound HTTP traffic, which stops
+    # the Telegram long-polling loop. Keep at least `starter` for an always-on
+    # bot, or leave the plan unset and pick it in the dashboard.
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Secrets below are filled in via the Render dashboard (Environment tab).
+      - key: BOT_TOKEN
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: CHANNEL_ID
+        sync: false
+      - key: ADMIN_API_KEY
+        sync: false

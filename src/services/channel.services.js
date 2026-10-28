@@ -7,6 +7,10 @@ class ChannelService {
     constructor() {
         this.bot = null;
         this.channelId = process.env.CHANNEL_ID;
+        // Public @username of the channel, needed to build
+        // https://t.me/<username>/<message_id> links. undefined = not looked
+        // up yet, null = looked up and the channel has no public username.
+        this.channelUsername = undefined;
     }
 
     // Set bot instance
@@ -19,6 +23,7 @@ class ChannelService {
     // Update channel ID
     setChannelId(channelId) {
         this.channelId = channelId;
+        this.channelUsername = undefined; // different channel → re-resolve
         logger.info(`Channel ID updated to: ${channelId}`);
         return true;
     }
@@ -50,6 +55,11 @@ class ChannelService {
                 }
             );
 
+            // sendMessage returns the chat, so the link username is free here
+            if (result.chat && result.chat.username) {
+                this.channelUsername = result.chat.username;
+            }
+
             logger.info(`✅ Confession ${confession._id} posted to channel. Message ID: ${result.message_id}`);
 
             return {
@@ -80,6 +90,30 @@ class ChannelService {
                 success: false,
                 error: error.message
             };
+        }
+    }
+
+    // Public link to an already-published channel post.
+    // Returns null when the channel has no public @username (private channels
+    // have no t.me/<name>/<id> URL), so the caller can skip the button instead
+    // of showing a dead link.
+    async getPostUrl(messageId) {
+        if (!this.bot || !this.channelId || !messageId) {
+            return null;
+        }
+        try {
+            if (this.channelUsername === undefined) {
+                const chat = await this.bot.getChat(this.channelId);
+                this.channelUsername = chat.username || null;
+            }
+            if (!this.channelUsername) {
+                logger.warn('Channel has no public username - skipping post link');
+                return null;
+            }
+            return `https://t.me/${this.channelUsername}/${messageId}`;
+        } catch (error) {
+            logger.warn(`Could not build channel post link: ${error.message}`);
+            return null;
         }
     }
 

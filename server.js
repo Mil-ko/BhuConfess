@@ -47,7 +47,10 @@ app.get('/stats', async (req, res) => {
 });
 
 // Start server
-app.listen(PORT, () => {
+// Host platforms (Render, Railway, ...) route traffic to the container's
+// external interface, so bind explicitly to 0.0.0.0 instead of loopback.
+const HOST = process.env.HOST || '0.0.0.0';
+app.listen(PORT, HOST, () => {
     logger.info(`🚀 Express server running on port ${PORT}`);
     logger.info(`🔍 Health check: http://localhost:${PORT}/health`);
     logger.info(`📊 Stats: http://localhost:${PORT}/stats`);

@@ -2,11 +2,11 @@
 module.exports = {
     // Bot messages
     MESSAGES: {
-        WELCOME: `👋 Welcome to the Anonymous Confession Bot!
+        WELCOME: `🌙 Welcome to Anonymous Confessions!
 
-Share what's on your mind — completely anonymously.
+💭 Got something on your mind? Share your thoughts, secrets, or feelings anonymously.
 
-Use the menu below to get started:`,
+👇 Use the menu below to get started!`,
         MENU: '🏠 Main Menu\n\nChoose an option:',
         HELP: `📖 Help
 

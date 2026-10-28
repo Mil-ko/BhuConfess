@@ -11,7 +11,7 @@ A Telegram bot where users pick a topic, write a confession, preview/edit it, an
 3. Write the confession → **preview** with **Edit / Submit / Cancel**
 4. Submit → the confession is **locked** and sent to the admin review chat (`pending`)
 5. Admin taps **Approve** or **Reject** (only configured admin IDs work, checked server-side)
-6. The author gets a **private notification** of the decision (only if they pressed `/start`)
+6. The author gets a **private notification** of the decision (only if they pressed `/start`); on approval it carries a **📢 View on Channel** button that links straight to their published post (`https://t.me/<channel>/<message_id>`). Channels without a public `@username` get no button rather than a dead link
 7. On approval the confession is posted to the channel showing the author's **nickname** (`Confession from <nickname>`, or `Anonymous Confession` if none was set) with two buttons:
    - **💬 Browse Comments (N)** — shows the live comment count, which is refreshed on the channel post every time a comment or reply arrives; deep link that **opens the bot directly on the comments page** (paginated; each top-level comment has a **Reply** button)
    - **✏️ Send Comment** — deep link that opens the bot with the comment prompt ready: write → preview → submit; replies are one level deep
@@ -139,7 +139,7 @@ draft → preview (edit/cancel) → submitted (locked, pending)
 node scripts/verify-flow.js
 ```
 
-Drives the **real** controllers with a mocked Telegram transport: nickname onboarding and cooldown, menu, topics, preview/edit/submit, locking, admin approve/reject with permission checks, decision + comment/reply notifications, live comment counts on the channel button, channel publishing with nickname + deep-link buttons, comments, threaded replies, and profile — 36 assertions, then cleans up its own test data.
+Drives the **real** controllers with a mocked Telegram transport: nickname onboarding and cooldown, menu, topics, preview/edit/submit, locking, admin approve/reject with permission checks, decision + comment/reply notifications, live comment counts on the channel button, channel publishing with nickname + deep-link buttons, the approval DM's link to the channel post, comments, threaded replies, and profile — 37 assertions, then cleans up its own test data.
 
 ## Data & Privacy
 
@@ -148,6 +148,25 @@ Confessions store: text, topic, status, timestamps, metadata, admin action detai
 ## Logging
 
 Winston writes to the console plus `logs/combined.log` and `logs/error.log` (5 MB × 5 files each). The `logs/` directory is created automatically and is gitignored.
+
+## Deploying to Render
+
+The repo ships a [render.yaml](render.yaml) blueprint, so Render can create the service for you.
+
+1. Push the repo to GitHub (do **not** commit `.env` — it is gitignored).
+2. On [Render](https://render.com): **New + → Blueprint**, connect the repo. Render reads `render.yaml` and proposes a **Web Service** with build `npm ci` and start `npm start`.
+   - Manual alternative: **New + → Web Service**, Runtime **Node**, Build Command `npm ci`, Start Command `npm start`, Health Check Path `/health`.
+3. Add the environment variables in **Environment** (the blueprint marks them `sync: false`, so you fill them in): `BOT_TOKEN`, `MONGODB_URI`, `ADMIN_ID`, and optionally `CHANNEL_ID` / `ADMIN_API_KEY` / `NODE_ENV=production`. `PORT` is injected by Render — don't set it.
+4. In **MongoDB Atlas → Network Access**, allow Render's outbound IP ranges (Dashboard → your service → **Connect → Outbound**) — or `0.0.0.0/0` for a quick test. Atlas rejects unlisted sources and the bot exits on a failed connect.
+5. Deploy, then open `https://<service>.onrender.com/health` — expect `"status":"OK"` with `botToken`, `adminId` and `database` configured. Logs are in the Dashboard's **Logs** tab.
+
+### Things that bite on Render
+
+- **Use a paid instance for an always-on bot.** Free Web Services **spin down after 15 minutes without inbound HTTP traffic**; outbound Telegram polling does not count, so the bot silently stops answering. Background Workers stay alive but have no HTTP port (no `/health`), and are not offered on the free plan.
+- **Keep it at exactly one instance.** Two running copies poll Telegram at once and errors with `409 Conflict`; do not enable autoscaling.
+- **The filesystem is ephemeral.** `logs/*.log` and anything else written to disk disappear on redeploy/restart — read logs in the Render dashboard (7-day retention on Hobby) or add a persistent disk.
+- **The server binds `0.0.0.0:PORT`** (Render's default `PORT` is `10000`); `HOST` can override the interface but is not needed.
+- **Set the bot's channel admin rights** before approving anything, and use `/setchannel` if `CHANNEL_ID` is not set — otherwise approvals post nothing and log a failure.
 
 ## License
 
