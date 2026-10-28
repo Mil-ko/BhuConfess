@@ -13,15 +13,50 @@ const logger = require('./src/utils/logger');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Render (like every PaaS) terminates TLS on its own proxy and forwards the
+// real client IP in X-Forwarded-For. Without this, express-rate-limit warns
+// ERR_ERL_UNEXPECTED_X_FORWARDED_FOR and keys every request on the proxy, so
+// all visitors share one bucket (the proxy's own /health probes then 429 and
+// the service looks unhealthy). It is only enabled when running on Render (or
+// explicitly), so a local run can't be spoofed with a forged header.
+// TRUST_PROXY overrides it: a hop count, "true", or "false" to disable.
+const trustProxy = process.env.TRUST_PROXY !== undefined
+    ? process.env.TRUST_PROXY
+    : (process.env.RENDER === 'true' ? '1' : null);
+if (trustProxy !== null && trustProxy !== 'false') {
+    const hops = Number(trustProxy);
+    if (trustProxy !== '' && Number.isFinite(hops)) {
+        app.set('trust proxy', hops); // "1" (one proxy hop) or "2"
+    } else {
+        app.set('trust proxy', true); // "true" -> trust the whole chain
+    }
+}
+
 // Security and utility middleware
 app.use(helmet()); // Security headers
 app.use(compression()); // Compress responses
 app.use(express.json()); // Parse JSON bodies
 app.use(authMiddleware.rateLimiter); // Rate limiting
 
+// Bound the DB ping so a stalled Mongo socket cannot hang the health check
+// past the platform's probe timeout (which would look like a dead service).
+const DB_PING_TIMEOUT_MS = Number(process.env.DB_PING_TIMEOUT_MS) || 4000;
+
+function withTimeout(promise, ms, fallback) {
+    let timer;
+    const timeout = new Promise((resolve) => {
+        timer = setTimeout(() => resolve(fallback), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 // Health check route with database status
 app.get('/health', async (req, res) => {
-    const dbHealth = await databaseService.healthCheck();
+    const dbHealth = await withTimeout(
+        databaseService.healthCheck(),
+        DB_PING_TIMEOUT_MS,
+        { isConnected: false, dbStatus: 'timeout', error: 'Database ping timed out' }
+    );
     
     res.json({ 
         status: 'OK', 
@@ -50,10 +85,18 @@ app.get('/stats', async (req, res) => {
 // Host platforms (Render, Railway, ...) route traffic to the container's
 // external interface, so bind explicitly to 0.0.0.0 instead of loopback.
 const HOST = process.env.HOST || '0.0.0.0';
-app.listen(PORT, HOST, () => {
-    logger.info(`🚀 Express server running on port ${PORT}`);
-    logger.info(`🔍 Health check: http://localhost:${PORT}/health`);
-    logger.info(`📊 Stats: http://localhost:${PORT}/stats`);
+
+const server = app.listen(PORT, HOST, () => {
+    logger.info(`🚀 Express server listening on ${HOST}:${PORT}`);
+    // On Render the public origin is injected; locally fall back to loopback.
+    const publicUrl = (process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
+    logger.info(`🔍 Health check: ${publicUrl}/health`);
+    logger.info(`📊 Stats: ${publicUrl}/stats`);
+});
+
+server.on('error', (error) => {
+    logger.error(`❌ HTTP server could not bind ${HOST}:${PORT} - ${error.message}`);
+    process.exit(1);
 });
 
 // Initialize and launch Telegram bot with database
@@ -89,19 +132,29 @@ app.listen(PORT, HOST, () => {
 })();
 
 // Graceful shutdown handlers
-process.once('SIGINT', async () => {
-    logger.info('Received SIGINT signal');
+// The platform sends SIGTERM and then SIGKILLs after a grace period, so stop
+// polling, stop accepting connections and exit instead of hanging.
+async function shutdown(signal) {
+    logger.info(`Received ${signal} - shutting down`);
     telegramService.stop();
-    await databaseService.healthCheck(); // Will trigger disconnect if needed
-    process.exit(0);
-});
 
-process.once('SIGTERM', async () => {
-    logger.info('Received SIGTERM signal');
-    telegramService.stop();
-    await databaseService.healthCheck(); // Will trigger disconnect if needed
+    await new Promise((resolve) => {
+        server.close(resolve);
+        // Keep-alive sockets (e.g. the platform's health checker) would
+        // otherwise hold the server open until the SIGKILL.
+        if (typeof server.closeAllConnections === 'function') {
+            server.closeAllConnections();
+        }
+    }).catch(() => {});
+
+    // Mongoose handlers in config/database.js disconnect on SIGTERM; this call
+    // only nudges them, so it must never delay the exit past the grace period.
+    await withTimeout(databaseService.healthCheck(), 3000, null).catch(() => {});
     process.exit(0);
-});
+}
+
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
 
 // Handle uncaught exceptions
 process.on('uncaughtException', (error) => {

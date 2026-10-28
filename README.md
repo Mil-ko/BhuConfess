@@ -91,6 +91,8 @@ cp .env.example .env   # then fill in your values
 | `ADMIN_ID` | **Yes** (for admin) | Admin Telegram ID(s), comma-separated for multiple admins |
 | `CHANNEL_ID` | No | Default channel (`@username` or `-100…` ID). Can also be set with `/setchannel` |
 | `ADMIN_API_KEY` | No | Shared secret for HTTP endpoints guarded by `x-admin-key` |
+| `TRUST_PROXY` | No | Proxy hops to trust when reading the client IP. Auto `1` on Render; set `false` to disable |
+| `DB_PING_TIMEOUT_MS` | No (default `4000`) | How long `/health` waits for the MongoDB ping before reporting `timeout` |
 
 The bot refuses to start if `BOT_TOKEN` or `MONGODB_URI` is missing.
 
@@ -165,7 +167,9 @@ The repo ships a [render.yaml](render.yaml) blueprint, so Render can create the 
 - **Use a paid instance for an always-on bot.** Free Web Services **spin down after 15 minutes without inbound HTTP traffic**; outbound Telegram polling does not count, so the bot silently stops answering. Background Workers stay alive but have no HTTP port (no `/health`), and are not offered on the free plan.
 - **Keep it at exactly one instance.** Two running copies poll Telegram at once and errors with `409 Conflict`; do not enable autoscaling.
 - **The filesystem is ephemeral.** `logs/*.log` and anything else written to disk disappear on redeploy/restart — read logs in the Render dashboard (7-day retention on Hobby) or add a persistent disk.
-- **The server binds `0.0.0.0:PORT`** (Render's default `PORT` is `10000`); `HOST` can override the interface but is not needed.
+- **The server binds `0.0.0.0:PORT`** (Render's default `PORT` is `10000`); `HOST` can override the interface but is not needed. The startup log prints the real bind address and uses `RENDER_EXTERNAL_URL` for the health/stats URLs, so it never claims `localhost` on a deployed instance.
+- **`trust proxy` turns on automatically on Render (`1` hop).** Render terminates TLS and forwards the client IP in `X-Forwarded-For`; without it express-rate-limit logs `ERR_ERL_UNEXPECTED_X_FORWARDED_FOR` and every visitor shares one bucket keyed on the proxy (so `/health` probes can `429`, which Render reads as an unhealthy service). Locally it stays off, so a forged header can't dodge the limiter. Override with `TRUST_PROXY=<hops|true|false>`.
+- **`/health` never hangs.** The MongoDB ping is bounded by `DB_PING_TIMEOUT_MS` and reports `"dbStatus":"timeout"` instead of stalling past Render's probe timeout. `SIGTERM` stops polling and closes the HTTP server (including keep-alive sockets) so deploys don't wait for the grace period to expire.
 - **Set the bot's channel admin rights** before approving anything, and use `/setchannel` if `CHANNEL_ID` is not set — otherwise approvals post nothing and log a failure.
 
 ## License
