@@ -93,6 +93,8 @@ cp .env.example .env   # then fill in your values
 | `ADMIN_API_KEY` | No | Shared secret for HTTP endpoints guarded by `x-admin-key` |
 | `TRUST_PROXY` | No | Proxy hops to trust when reading the client IP. Auto `1` on Render; set `false` to disable |
 | `DB_PING_TIMEOUT_MS` | No (default `4000`) | How long `/health` waits for the MongoDB ping before reporting `timeout` |
+| `KEEPALIVE` | No (default off) | `true` pings the service's own public URL every 10 min so a Render **Free** instance never hits the 15-minute idle spin-down |
+| `KEEPALIVE_INTERVAL_MS` | No (default `600000`) | Keep-alive period; must stay under 15 min to be useful |
 
 The bot refuses to start if `BOT_TOKEN` or `MONGODB_URI` is missing.
 
@@ -123,7 +125,7 @@ Approve/reject also work directly from the buttons on each review message.
 
 | Endpoint | Description |
 | --- | --- |
-| `GET /health` | Uptime, config status, DB health |
+| `GET /health` | Uptime, config status, DB health, and **bot status** (`bot.state`, `bot.username`, `bot.polling`, `bot.lastUpdateAt`, `bot.lastError`) |
 | `GET /stats` | Confession counts by status |
 
 ## Confession Lifecycle
@@ -164,13 +166,31 @@ The repo ships a [render.yaml](render.yaml) blueprint, so Render can create the 
 
 ### Things that bite on Render
 
-- **Use a paid instance for an always-on bot.** Free Web Services **spin down after 15 minutes without inbound HTTP traffic**; outbound Telegram polling does not count, so the bot silently stops answering. Background Workers stay alive but have no HTTP port (no `/health`), and are not offered on the free plan.
+- **Free instances sleep, and that stops the bot.** Render spins a Free Web Service down after **15 minutes without inbound HTTP traffic**; outbound Telegram long-polling does not count as traffic, so the process is stopped and the bot goes silent until someone opens the URL again (then it takes ~1 min to wake). See [the diagnosis below](#bot-stopped-answering-the-symptom-this-readme-keeps-describing) for the three ways out.
 - **Keep it at exactly one instance.** Two running copies poll Telegram at once and errors with `409 Conflict`; do not enable autoscaling.
 - **The filesystem is ephemeral.** `logs/*.log` and anything else written to disk disappear on redeploy/restart — read logs in the Render dashboard (7-day retention on Hobby) or add a persistent disk.
 - **The server binds `0.0.0.0:PORT`** (Render's default `PORT` is `10000`); `HOST` can override the interface but is not needed. The startup log prints the real bind address and uses `RENDER_EXTERNAL_URL` for the health/stats URLs, so it never claims `localhost` on a deployed instance.
 - **`trust proxy` turns on automatically on Render (`1` hop).** Render terminates TLS and forwards the client IP in `X-Forwarded-For`; without it express-rate-limit logs `ERR_ERL_UNEXPECTED_X_FORWARDED_FOR` and every visitor shares one bucket keyed on the proxy (so `/health` probes can `429`, which Render reads as an unhealthy service). Locally it stays off, so a forged header can't dodge the limiter. Override with `TRUST_PROXY=<hops|true|false>`.
 - **`/health` never hangs.** The MongoDB ping is bounded by `DB_PING_TIMEOUT_MS` and reports `"dbStatus":"timeout"` instead of stalling past Render's probe timeout. `SIGTERM` stops polling and closes the HTTP server (including keep-alive sockets) so deploys don't wait for the grace period to expire.
 - **Set the bot's channel admin rights** before approving anything, and use `/setchannel` if `CHANNEL_ID` is not set — otherwise approvals post nothing and log a failure.
+
+### Bot stopped answering? The symptom this README keeps describing
+
+A bot that replies right after deploying and is silent the next morning is almost always one of three things, in this order:
+
+1. **The Free instance spun down** (15 min of no inbound HTTP). Open `https://<service>.onrender.com/health`; if it takes ~1 min and then answers, that was it. Logs show a fresh `Starting Confession Bot...` with no error.
+2. **`409 Conflict: terminated by other getUpdates request`** — a second process polls the same `BOT_TOKEN` (a local `npm start`, a leftover deploy, or a second Render instance). Telegram allows one consumer per token; the loser keeps failing. Stop the other process. The service now logs which one it hit and retries with backoff (2s → 4s → … → 60s, 5 attempts) instead of exiting, so a deploy overlap heals itself.
+3. **`401 Unauthorized`** — the token was revoked/regenerated in @BotFather. This is fatal and the log says so; update `BOT_TOKEN` in the dashboard.
+
+`/health` answers 1 and 2 without opening the logs:
+
+```json
+"bot": { "state": "running", "username": "@BhuConfessionbot", "polling": true, "secondsSinceLastUpdate": 42, "lastError": null }
+```
+
+`bot.state` is `starting` (before the first poll), `running`, `stopped`, or `not-polling` (a `lastError` explains why). `polling: false` during normal operation means the bot is not consuming messages. `lastError` is kept after a recovery so you can still see why polling dropped and when.
+
+**Keeping a Free instance awake.** Set `KEEPALIVE=true`; the process then GETs its own `RENDER_EXTERNAL_URL/health` every 10 minutes, those requests reach the app through Render's proxy, and the idle timer never expires. It needs `RENDER_EXTERNAL_URL` (Render injects it) and logs `🔁 Keep-alive enabled` on boot. This is a workaround for a plan limit: Render's docs describe paid instance types as the supported way to run continuously, and an external uptime monitor (any service that fetches the URL every few minutes) achieves the same thing without touching the code. If you would rather not do either, upgrade the instance — a paid plan does not spin down.
 
 ## License
 

@@ -7,11 +7,16 @@ const compression = require('compression');
 const telegramService = require('./src/services/telegram.service');
 const databaseService = require('./src/services/database.service');
 const authMiddleware = require('./src/middleware/auth.middleware');
+const keepalive = require('./src/utils/keepalive');
 const logger = require('./src/utils/logger');
 
 // Initialize Express app
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Set by the signal handler so a launch() that resolves *because* we are
+// shutting down isn't mistaken for a bot that died on its own (see below).
+let shuttingDown = false;
 
 // Render (like every PaaS) terminates TLS on its own proxy and forwards the
 // real client IP in X-Forwarded-For. Without this, express-rate-limit warns
@@ -65,6 +70,9 @@ app.get('/health', async (req, res) => {
         uptime: process.uptime(),
         botToken: process.env.BOT_TOKEN ? '✓ Configured' : '✗ Missing',
         adminId: process.env.ADMIN_ID ? '✓ Configured' : '✗ Missing',
+        // Tells a live poller apart from a process that is up but no longer
+        // receiving updates - the failure mode that looks like "it just stopped".
+        bot: telegramService.getStatus(),
         database: dbHealth,
         environment: process.env.NODE_ENV,
         version: process.env.npm_package_version || '1.0.0'
@@ -92,6 +100,17 @@ const server = app.listen(PORT, HOST, () => {
     const publicUrl = (process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
     logger.info(`🔍 Health check: ${publicUrl}/health`);
     logger.info(`📊 Stats: ${publicUrl}/stats`);
+
+    // Render's public origin is the only URL that reaches the app from outside,
+    // so it is what the keep-alive pings (see src/utils/keepalive.js).
+    if (String(process.env.KEEPALIVE).toLowerCase() === 'true') {
+        keepalive.start({
+            baseUrl: process.env.RENDER_EXTERNAL_URL,
+            intervalMs: process.env.KEEPALIVE_INTERVAL_MS
+        });
+    } else if (process.env.RENDER === 'true') {
+        logger.warn('Free plan: this instance spins down after 15 min without inbound traffic and stops the bot. Set KEEPALIVE=true (or upgrade the instance type) to stay online.');
+    }
 });
 
 server.on('error', (error) => {
@@ -122,8 +141,16 @@ server.on('error', (error) => {
         // Initialize and launch bot
         telegramService.initialize(process.env.BOT_TOKEN);
         await telegramService.launch();
-        
-        logger.info('✨ Bot is ready! Start chatting on Telegram');
+
+        // launch() only resolves once polling stops. Unless that was our own
+        // shutdown, the process is now an HTTP server with no bot attached:
+        // it looks healthy to Render and answers nothing on Telegram. Exit so
+        // the platform restarts it with a clean poller.
+        if (!shuttingDown) {
+            logger.error('❌ Bot polling loop ended on its own - exiting so the platform restarts the service');
+            process.exit(1);
+        }
+        logger.info('Bot stopped, shutdown complete');
         
     } catch (error) {
         logger.error('❌ Failed to start application:', error);
@@ -135,6 +162,7 @@ server.on('error', (error) => {
 // The platform sends SIGTERM and then SIGKILLs after a grace period, so stop
 // polling, stop accepting connections and exit instead of hanging.
 async function shutdown(signal) {
+    shuttingDown = true;
     logger.info(`Received ${signal} - shutting down`);
     telegramService.stop();
 

@@ -8,9 +8,41 @@ const logger = require('../utils/logger');
 
 const ID_RE = /^[0-9a-f]{24}$/i;
 
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 class TelegramService {
     constructor() {
         this.bot = null;
+        // Health/diagnostics state, surfaced through /health. Without it a
+        // remotely-deployed bot that stopped polling looks identical to a
+        // healthy one from the outside.
+        this.polling = false;
+        this.startedAt = null;
+        this.lastUpdateAt = null;
+        this.launchAttempt = 0;
+        this.lastError = null;
+    }
+
+    // Snapshot for /health - no secrets, safe to return publicly.
+    getStatus() {
+        const botInfo = this.bot && this.bot.botInfo;
+        // "starting" right after boot, so a health check a second into the
+        // deploy doesn't look like a dead bot.
+        const state = this.polling
+            ? 'running'
+            : (this.lastError ? 'not-polling' : (this.startedAt ? 'stopped' : 'starting'));
+        return {
+            state,
+            username: botInfo ? `@${botInfo.username}` : null,
+            polling: this.polling,
+            startedAt: this.startedAt ? new Date(this.startedAt).toISOString() : null,
+            lastUpdateAt: this.lastUpdateAt ? new Date(this.lastUpdateAt).toISOString() : null,
+            secondsSinceLastUpdate: this.lastUpdateAt
+                ? Math.round((Date.now() - this.lastUpdateAt) / 1000)
+                : null,
+            launchAttempt: this.launchAttempt,
+            lastError: this.lastError
+        };
     }
 
     // Initialize bot with token
@@ -35,6 +67,13 @@ class TelegramService {
     setupHandlers() {
         if (!this.bot) return;
         const bot = this.bot;
+
+        // Record inbound activity before anything else so /health can tell a
+        // live poller from a zombie process.
+        bot.use((ctx, next) => {
+            this.lastUpdateAt = Date.now();
+            return next();
+        });
 
         // ── Public commands ────────────────────────────────────
         bot.start((ctx) => botController.handleStart(ctx));
@@ -175,8 +214,13 @@ class TelegramService {
             // NOTE: in Telegraf 4, launch() only resolves after the bot
             // stops - so all "launched" logging happens in the onLaunch
             // callback, which fires right after getMe succeeds.
+            this.launchAttempt += 1;
             const onLaunch = () => {
                 const botInfo = this.bot.botInfo;
+                this.polling = true;
+                this.startedAt = Date.now();
+                // lastError is kept on purpose: after a recovery /health still
+                // shows why polling dropped, with the time it happened.
                 logger.info('🤖 Bot launched successfully (long polling)');
                 logger.info(`📱 Bot Info: @${botInfo.username} (ID: ${botInfo.id})`);
 
@@ -187,9 +231,52 @@ class TelegramService {
                 }
             };
 
-            await this.bot.launch({}, onLaunch);
+            // Telegraf only rejects launch() when polling dies: a revoked token
+            // (401), a second instance polling the same token (409), or a
+            // network fault. Exiting on all of them turns a short overlap into
+            // a permanent crash loop, so retry with backoff instead.
+            const MAX_ATTEMPTS = 5;
+            const backoffMs = Math.min(60000, 2000 * 2 ** (this.launchAttempt - 1));
+
+            try {
+                await this.bot.launch({}, onLaunch);
+            } catch (error) {
+                this.polling = false;
+                this.lastError = {
+                    code: error.code,
+                    message: error.message,
+                    at: new Date().toISOString()
+                };
+
+                const isFatal = error.code === 401 || error.code === 404 ||
+                    /unauthorized|not found/i.test(error.message || '');
+                const attemptsLeft = MAX_ATTEMPTS - this.launchAttempt;
+
+                if (isFatal) {
+                    logger.error(`❌ Bot token rejected by Telegram (${error.message}) - fix BOT_TOKEN in the dashboard`);
+                } else if (attemptsLeft <= 0) {
+                    logger.error(`❌ Bot polling failed ${MAX_ATTEMPTS} times in a row - giving up: ${error.message}`);
+                } else {
+                    const hint = error.code === 409
+                        ? 'another process is polling this same token - stop any local `npm start`, or wait for the old deploy to finish'
+                        : 'transient Telegram/network failure';
+                    logger.warn(`⚠️ Bot polling stopped (${error.message}) - ${hint}. Retry ${this.launchAttempt + 1}/${MAX_ATTEMPTS} in ${Math.round(backoffMs / 1000)}s`);
+                    await wait(backoffMs);
+                    return this.launch();
+                }
+                throw error;
+            }
+
+            // launch() resolving means polling was stopped deliberately.
+            this.polling = false;
             return true;
         } catch (error) {
+            this.polling = false;
+            this.lastError = this.lastError || {
+                code: error.code,
+                message: error.message,
+                at: new Date().toISOString()
+            };
             logger.error('Failed to launch bot:', error);
             throw error;
         }
@@ -197,9 +284,17 @@ class TelegramService {
 
     // Stop the bot gracefully
     stop() {
-        if (this.bot) {
+        if (!this.bot || !this.polling) {
+            // Telegraf throws "Bot is not running!" here, which used to abort
+            // the SIGTERM handler before the HTTP server was closed.
+            return;
+        }
+        try {
             this.bot.stop();
+            this.polling = false;
             logger.info('🛑 Bot stopped');
+        } catch (error) {
+            logger.warn(`Bot stop skipped: ${error.message}`);
         }
     }
 }
