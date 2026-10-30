@@ -107,19 +107,50 @@ npm start      # production
 
 ## Bot Commands
 
-**Public:** `/start` (main menu) · `/help` · `/status` · `/privacy` · `/about`
+**Public:** `/start` · `/menu` · `/help` · `/status` · `/privacy` · `/about`
 
 **Admin** (only configured `ADMIN_ID`s):
 
 | Command | Description |
 | --- | --- |
-| `/pending` | Review pending confessions with Approve/Reject buttons |
-| `/stats` | Statistics |
+| `/admin` | Admin panel: pending / approved / rejected / stats / users / management |
+| `/pending` | Review pending confessions as messages with action buttons |
+| `/stats` | Quick statistics |
 | `/setchannel <@channel>` | Set/verify the publishing channel |
 | `/post <id>` | Retry publishing an approved confession |
 | `/adminhelp` | Admin command reference |
 
-Approve/reject also work directly from the buttons on each review message.
+Decisions are also reachable from every review message. Approve/Reject always ask for confirmation first; nothing is executed on the first tap.
+
+## Screens
+
+One design system everywhere: one emoji per action, at most two buttons per row, primary action on its own row, and `🔙 Back` / `🏠 Main Menu` on every screen.
+
+```text
+🏠 Main Menu
+[✍️ Send a Confession]
+[💬 Browse Confessions] [👤 My Profile]
+[📊 My Activity]        [ℹ️ About]
+[📩 Contact Admin]
+```
+
+| Screen | Actions |
+| --- | --- |
+| Confession draft | topic (2 per row, **🔙 Back**) → preview: `✏️ Edit Confession`, `🗑️ Cancel`, `✅ Submit Confession` |
+| `💬 Browse Confessions` | paged feed (3 per page); each card: `💬 Open Discussion`, `✍️ Send Comment`; header: `✍️ Send a Confession`, `🏠 Main Menu` |
+| `👤 My Profile` | `✏️ Change Nickname`; `📊 My Confessions`; `💬 My Comments`; `🔙 Back to Menu` |
+| `📊 My Activity` | confessions by status, comments, replies, reactions received; links to both personal lists |
+| `📊 My Confessions` | paged cards with status + discussion link; `🔙 Back` / `🏠 Main Menu` |
+| `💬 My Comments` | paged cards quoting each comment + the confession it belongs to; `🔙 Back` / `🏠 Main Menu` |
+| `📩 Contact Admin` | validate (10–1000 chars) → preview → `📤 Send to Admins` / `🗑️ Cancel`; delivered to every `ADMIN_ID` |
+| Discussion | cards with reactions, Reply, View/Hide replies, pagination (see below) |
+| 🛠️ Admin Panel | `📥 Pending · n`, `✅ Approved · n`, `❌ Rejected · n`, `📊 Bot Statistics`, `👥 User Statistics`, `⚙️ Bot Management`, `🏠 Main Menu` |
+| Admin lists | paged cards (3 per page); pending: `👁️ Preview`, `✏️ Request Changes`, `✅ Approve`, `❌ Reject`; approved/rejected: `👁️ Preview`, `📢 Post / Repost` |
+| Decision | `✅ Approve` → confirmation (`✅ Yes, Approve` / `🔙 Back`) → published + author notified |
+| Request changes | admin types a 10–500 char note → preview → `📤 Send Note` / `🗑️ Cancel`; the confession stays unpublished |
+| Bot Management | live bot handle, channel, database state, uptime, keep-alive; `🔄 Refresh Status`, `📊 Bot Statistics`, `🔙 Admin Panel` |
+
+The profile screen deliberately shows the **nickname**, not the Telegram name, so nothing on screen can leak an author's identity.
 
 ## HTTP Endpoints
 
@@ -132,10 +163,62 @@ Approve/reject also work directly from the buttons on each review message.
 
 ```
 draft → preview (edit/cancel) → submitted (locked, pending)
-                                      ├─ approved → posted to channel (+ comment buttons)
-                                      └─ rejected
-             both decisions → private notification to the author
+                                      ├─ approved  → posted to channel (+ comment buttons)
+                                      ├─ rejected  → author notified, nothing published
+                                      └─ changes requested → note sent, stays unpublished
+             every decision → private notification to the author
 ```
+
+## Comments & Discussions
+
+Comments never touch the channel — the whole discussion lives in the bot's private chat, drawn as separate blocks:
+
+```text
+💬 Discussion · page 1/2          ← header: confession excerpt, count,
+   "I secretly debug production…"    Prev/Next, Send Comment, Menu
+📊 4 comments
+
+💬 #1 · AllyCat · 2h ago          ← one card per top-level comment
+  I secretly debug production at 3am. No regrets.
+  ↳ 2 replies · tap to open
+  [❤️ 2 ✓] [😂] [🔥 1] [👍]         ← reactions, tap to toggle, ✓ = yours
+  [↩️ Reply] [🔽 2 replies]         ← reply / expand
+
+💬 #2 · Bobby · 1h ago
+  I have been pretending to understand the timetable for two years.
+  [❤️] [😂] [🔥] [👍]
+  [↩️ Reply]
+```
+
+Expanding a thread edits that same card, nesting its replies (author + timestamp each) and giving every reply its own `↩️ Reply · <name>` button.
+
+- **One level of nesting, by construction.** Tapping Reply on a *reply* still stores `parentCommentId` as the thread's top-level comment, and records the comment that was actually addressed in `replyToCommentId`. Depth can never grow, while the right person still gets notified.
+- **Context before typing.** The comment being answered is quoted (with its author) when the reply flow opens *and* above the draft preview.
+- **The target is re-verified on submit.** It must still exist, belong to the same confession and still be top-level — otherwise the draft is dropped with a message instead of being saved against the wrong comment.
+- **One identity per discussion.** Every person resolves to a single name for the whole discussion (current nickname, else a stable `Anon #N`), so a rename never leaves one person under two names.
+- **In-place paging.** 4 cards per page; Prev/Next edits those messages and deletes surplus blocks rather than posting new ones (which is also why a card is re-rendered in place when you react or expand it).
+- **Size limits.** 4 replies shown per expanded thread (most recent, `+N earlier` for the rest), 700 characters of a comment and 320 per reply per card — keeping every card under Telegram's 4096-character message cap.
+- **Reactions** (`❤️ 😂 🔥 👍`) store the Telegram ids that tapped them, become counts server-side, and toggle off on a second tap.
+
+### Callback scheme
+
+Telegram caps callback data at 64 bytes and every button must be routed, so the prefixes are:
+
+| Prefix | Meaning |
+| --- | --- |
+| `m_*` | menu, help, about, profile, nickname, activity, contact |
+| `p_conf_<page>` / `p_com_<page>` | my confessions / my comments |
+| `c_*` | confession flow: start, topic, edit, submit, cancel, back |
+| `f_browse_<page>` | confession feed |
+| `ct_send` / `ct_cancel` | contact-the-admins draft |
+| `cb_<cid>_<page>`, `cn_*`, `cr_*`, `cv_*` | discussion (page, write, react, expand) |
+| `a_*` | admin panel: hub, lists, stats, users, manage, ok/no/ch/post |
+| `av_<id>` | admin preview |
+| `ay_ok|no_<id>` | admin: confirmed decision |
+| `an_send|cancel_<id>` | admin: request-changes note |
+| `ad_ok|no_<id>` | legacy direct decisions (old review messages keep working) |
+
+`node scripts/verify-flow.js` asserts that every button the bot builds has a label, a routed prefix and a way back.
 
 ## Testing
 
@@ -143,11 +226,11 @@ draft → preview (edit/cancel) → submitted (locked, pending)
 node scripts/verify-flow.js
 ```
 
-Drives the **real** controllers with a mocked Telegram transport: nickname onboarding and cooldown, menu, topics, preview/edit/submit, locking, admin approve/reject with permission checks, decision + comment/reply notifications, live comment counts on the channel button, channel publishing with nickname + deep-link buttons, the approval DM's link to the channel post, comments, threaded replies, and profile — 37 assertions, then cleans up its own test data.
+Drives the **real** controllers with a mocked Telegram transport: nickname onboarding and cooldown, menu, topics, preview/edit/submit, locking, admin approve/reject with permission checks, decision + comment/reply notifications, live comment counts on the channel button, channel publishing with nickname + deep-link buttons, the approval DM's link to the channel post, the discussion UI — cards, reaction toggling per user, reply context, nesting, expand/collapse, cross-discussion reply rejection, pagination + HTML escaping, identity consistency and pre-redesign comments — the profile/activity/personal-list screens, the confession feed, contact-the-admins delivery, the whole admin panel (hub, lists, preview, confirmation, request-changes, stats, users, management), expired-callback recovery, the double-tap guard and a button inventory, and a check that every outbound message is valid Telegram HTML (balanced tags, ≤4096 chars): **67 assertions**, then cleans up its own test data.
 
 ## Data & Privacy
 
-Confessions store: text, topic, status, timestamps, metadata, admin action details, the author's Telegram ID **in a separate field** (used only for the decision notification and profile counts — stripped from every public/admin view), and the public **nickname snapshot**. Comments store the same. The `users` collection holds only `telegramId`, `nickname`, and the last-change timestamp.
+Confessions store: text, topic, status, timestamps, metadata, admin action details, the author's Telegram ID **in a separate field** (used only for the decision notification and profile counts — stripped from every public/admin view), and the public **nickname snapshot**. Comments store the same, plus `parentCommentId` / `replyToCommentId` and a `reactions` map of `{ heart, laugh, fire, like }` holding the Telegram ids that tapped — those arrays are only ever turned into counts before anything is rendered. The `users` collection holds only `telegramId`, `nickname`, and the last-change timestamp.
 
 ## Logging
 

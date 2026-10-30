@@ -77,6 +77,7 @@ class TelegramService {
 
         // ── Public commands ────────────────────────────────────
         bot.start((ctx) => botController.handleStart(ctx));
+        bot.command('menu', (ctx) => botController.showMenu(ctx));
         bot.help((ctx) => botController.handleHelp(ctx));
         bot.command('privacy', (ctx) => botController.handlePrivacy(ctx));
         bot.command('about', (ctx) => botController.handleAbout(ctx));
@@ -88,6 +89,7 @@ class TelegramService {
         bot.command('setchannel', authMiddleware.isAdmin, (ctx) => adminController.setChannel(ctx));
         bot.command('post', authMiddleware.isAdmin, (ctx) => adminController.postCommand(ctx));
         bot.command('adminhelp', authMiddleware.isAdmin, (ctx) => adminController.adminHelp(ctx));
+        bot.command('admin', authMiddleware.isAdmin, (ctx) => adminController.showHub(ctx));
 
         // ── Central callback router (all inline buttons) ───────
         bot.on('callback_query', (ctx) => this.routeCallback(ctx));
@@ -131,14 +133,105 @@ class TelegramService {
                 return;
             }
 
+            // ── Admin panel: a_* (screens/actions), av_* (preview),
+            // ay_* (confirmed decision), an_* (request-changes note) ──
+            if (prefix === 'a' || prefix === 'av' || prefix === 'ay' || prefix === 'an') {
+                if (!authMiddleware.isAdminId(ctx.from.id)) {
+                    logger.warn(`Unauthorized admin callback by ${ctx.from.id}: ${data}`);
+                    await this._answer(ctx, MESSAGES.ADMIN.NOT_ADMIN);
+                    return;
+                }
+
+                const action = parts[1];
+                const arg = parts[2];
+
+                if (prefix === 'av') return adminController.showPreview(ctx, action);
+                if (prefix === 'ay') {
+                    if (!arg || !ID_RE.test(arg)) {
+                        await this._answer(ctx, MESSAGES.ADMIN.INVALID_ID);
+                        return;
+                    }
+                    if (action === 'ok') return adminController.handleDecision(ctx, arg, true);
+                    if (action === 'no') return adminController.handleDecision(ctx, arg, false);
+                    await this._answer(ctx, 'Unknown action');
+                    return;
+                }
+                if (prefix === 'an') {
+                    if (!arg || !ID_RE.test(arg)) {
+                        await this._answer(ctx, MESSAGES.ADMIN.INVALID_ID);
+                        return;
+                    }
+                    if (action === 'send') return adminController.sendAdminNote(ctx, arg);
+                    if (action === 'cancel') return adminController.cancelAdminNote(ctx, arg);
+                    await this._answer(ctx, 'Unknown action');
+                    return;
+                }
+
+                switch (action) {
+                    case 'hub': return adminController.showHub(ctx);
+                    case 'pend': return adminController.showList(ctx, 'pending', arg);
+                    case 'appr': return adminController.showList(ctx, 'approved', arg);
+                    case 'rej': return adminController.showList(ctx, 'rejected', arg);
+                    case 'stats': return adminController.showStats(ctx);
+                    case 'users': return adminController.showUserStats(ctx);
+                    case 'manage': return adminController.showManagement(ctx);
+                    case 'ok':
+                    case 'no': {
+                        if (!arg || !ID_RE.test(arg)) {
+                            await this._answer(ctx, MESSAGES.ADMIN.INVALID_ID);
+                            return;
+                        }
+                        return adminController.confirmDecision(ctx, arg, action === 'ok');
+                    }
+                    case 'ch': {
+                        if (!arg || !ID_RE.test(arg)) {
+                            await this._answer(ctx, MESSAGES.ADMIN.INVALID_ID);
+                            return;
+                        }
+                        return adminController.requestChanges(ctx, arg);
+                    }
+                    case 'post': {
+                        if (!arg || !ID_RE.test(arg)) {
+                            await this._answer(ctx, MESSAGES.ADMIN.INVALID_ID);
+                            return;
+                        }
+                        return adminController.postAction(ctx, arg);
+                    }
+                }
+                await this._answer(ctx, 'Unknown action');
+                return;
+            }
+
             switch (prefix) {
-                // Menu / info
+                // Menu / info / profile
                 case 'm': {
                     const action = parts[1];
                     if (action === 'menu') return botController.showMenu(ctx);
                     if (action === 'help') return botController.showHelp(ctx);
                     if (action === 'profile') return botController.showProfile(ctx);
                     if (action === 'nick') return botController.startNicknameChange(ctx);
+                    if (action === 'activity') return botController.showActivity(ctx);
+                    if (action === 'about') return botController.handleAbout(ctx);
+                    if (action === 'contact') return botController.startContact(ctx);
+                    break;
+                }
+
+                // Personal lists: p_conf_<page> / p_com_<page>
+                case 'p': {
+                    const kind = parts[1] === 'com' ? 'com' : 'conf';
+                    return botController.showPersonalList(ctx, kind, parts[2]);
+                }
+
+                // Confession feed: f_browse_<page>
+                case 'f': {
+                    if (parts[1] !== 'browse') break;
+                    return botController.browseFeed(ctx, parts[2]);
+                }
+
+                // Contact the admins: ct_send / ct_cancel
+                case 'ct': {
+                    if (parts[1] === 'send') return botController.sendContact(ctx);
+                    if (parts[1] === 'cancel') return botController.cancelContact(ctx);
                     break;
                 }
 
@@ -151,6 +244,7 @@ class TelegramService {
                         case 'edit': return botController.editConfession(ctx);
                         case 'submit': return botController.submitConfession(ctx);
                         case 'cancel': return botController.cancelConfession(ctx);
+                        case 'back': return botController.backToTopics(ctx);
                     }
                     break;
                 }
@@ -181,6 +275,27 @@ class TelegramService {
                         case 'rcan': return botController.cancelReply(ctx, id);
                     }
                     break;
+                }
+
+                // Reaction on a comment: cr_<key>_<commentId>
+                case 'cr': {
+                    const key = parts[1];
+                    const id = parts[2];
+                    if (!id || !ID_RE.test(id)) {
+                        await this._answer(ctx, MESSAGES.COMMENT_NOT_FOUND);
+                        return;
+                    }
+                    return botController.toggleReaction(ctx, key, id);
+                }
+
+                // View / hide the replies of one thread: cv_<commentId>
+                case 'cv': {
+                    const id = parts[1];
+                    if (!id || !ID_RE.test(id)) {
+                        await this._answer(ctx, MESSAGES.COMMENT_NOT_FOUND);
+                        return;
+                    }
+                    return botController.toggleReplies(ctx, id);
                 }
             }
 

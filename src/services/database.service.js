@@ -552,7 +552,7 @@ class DatabaseService {
     // ── Comments (only ever shown inside the bot, never posted) ──────
 
     // Create a comment or a one-level reply
-    async createComment({ confessionId, authorId, nickname = null, text, parentCommentId = null }) {
+    async createComment({ confessionId, authorId, nickname = null, text, parentCommentId = null, replyToCommentId = null }) {
         try {
             if (!databaseConnection.isConnected) {
                 await this.initialize();
@@ -563,7 +563,8 @@ class DatabaseService {
                 authorId: authorId || null,
                 nickname: nickname || null,
                 text,
-                parentCommentId: parentCommentId || null
+                parentCommentId: parentCommentId || null,
+                replyToCommentId: replyToCommentId || null
             });
 
             const saved = await comment.save();
@@ -581,7 +582,9 @@ class DatabaseService {
     }
 
     // All comments for a confession, oldest first (pagination happens above)
-    async getComments(confessionId) {
+    // includeAuthor: keep authorId so the viewer can resolve one stable display
+    // name per person across the whole discussion.
+    async getComments(confessionId, includeAuthor = false) {
         try {
             if (!databaseConnection.isConnected) {
                 await this.initialize();
@@ -591,10 +594,73 @@ class DatabaseService {
                 .sort({ createdAt: 1 })
                 .limit(500);
 
-            return { success: true, comments: comments.map(c => c.toSafeObject()) };
+            return {
+                success: true,
+                comments: comments.map(c => (includeAuthor
+                    ? (() => { const obj = c.toObject(); delete obj.__v; return obj; })()
+                    : c.toSafeObject()))
+            };
         } catch (error) {
             logger.error('Error fetching comments:', error);
             return { success: false, error: 'Failed to fetch comments' };
+        }
+    }
+
+    // Current nicknames for a set of telegram ids → { id: nickname|null }
+    // Used to keep one person's name consistent across a whole discussion.
+    async getNicknames(telegramIds = []) {
+        try {
+            if (!databaseConnection.isConnected) {
+                await this.initialize();
+            }
+
+            const ids = [...new Set((telegramIds || []).filter(Boolean).map(String))];
+            if (!ids.length) return { success: true, nicknames: {} };
+
+            const users = await User.find({ telegramId: { $in: ids } }).select('telegramId nickname');
+            const nicknames = {};
+            for (const user of users) {
+                nicknames[String(user.telegramId)] = user.nickname || null;
+            }
+            return { success: true, nicknames };
+        } catch (error) {
+            logger.error('Error fetching nicknames:', error);
+            return { success: false, nicknames: {} };
+        }
+    }
+
+    // Toggle one reaction from one user on one comment.
+    // → { success, comment, reacted, counts }
+    async toggleReaction(commentId, telegramId, key) {
+        try {
+            if (!databaseConnection.isConnected) {
+                await this.initialize();
+            }
+
+            const comment = await Comment.findById(commentId);
+            if (!comment) {
+                return { success: false, error: 'Comment not found' };
+            }
+
+            const bucket = comment.reactions[key] || [];
+            const userId = String(telegramId);
+            const existing = bucket.indexOf(userId);
+            const reacted = existing === -1;
+
+            if (reacted) bucket.push(userId);
+            else bucket.splice(existing, 1);
+
+            comment.reactions[key] = bucket;
+            comment.markModified(`reactions.${key}`);
+            await comment.save();
+
+            return { success: true, comment: comment.toObject(), reacted, counts: comment.reactionCounts() };
+        } catch (error) {
+            logger.error('Error toggling reaction:', error);
+            if (error.name === 'CastError') {
+                return { success: false, error: 'Invalid comment ID' };
+            }
+            return { success: false, error: 'Failed to save reaction' };
         }
     }
 
@@ -700,6 +766,189 @@ class DatabaseService {
         } catch (error) {
             logger.error('Error setting nickname:', error);
             return { success: false, error: 'save failed' };
+        }
+    }
+
+    /* ── Paginated lists & activity for the redesigned UI ──────── */
+
+    // One page of confessions by status (null = every status).
+    async getConfessionsPage(status, limit = 4, page = 0) {
+        try {
+            if (!databaseConnection.isConnected) await this.initialize();
+
+            const filter = status ? { status } : {};
+            const skip = Math.max(0, page) * limit;
+            const [confessions, total] = await Promise.all([
+                Confession.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit),
+                Confession.countDocuments(filter)
+            ]);
+
+            return { success: true, total, confessions: confessions.map(c => c.toSafeObject()) };
+        } catch (error) {
+            logger.error('Error fetching confession page:', error);
+            return { success: false, total: 0, confessions: [] };
+        }
+    }
+
+    // A reader's own confessions, newest first.
+    async getConfessionsByAuthor(authorId, limit = 4, page = 0) {
+        try {
+            if (!databaseConnection.isConnected) await this.initialize();
+
+            const filter = { authorId: String(authorId) };
+            const skip = Math.max(0, page) * limit;
+            const [confessions, total] = await Promise.all([
+                Confession.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit),
+                Confession.countDocuments(filter)
+            ]);
+
+            return { success: true, total, confessions: confessions.map(c => c.toSafeObject()) };
+        } catch (error) {
+            logger.error('Error fetching author confessions:', error);
+            return { success: false, total: 0, confessions: [] };
+        }
+    }
+
+    // A reader's own comments (and replies), newest first, each annotated with
+    // the text of the confession it belongs to.
+    async getCommentsByAuthor(authorId, limit = 4, page = 0) {
+        try {
+            if (!databaseConnection.isConnected) await this.initialize();
+
+            const filter = { authorId: String(authorId) };
+            const skip = Math.max(0, page) * limit;
+            const [comments, total] = await Promise.all([
+                Comment.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit),
+                Comment.countDocuments(filter)
+            ]);
+
+            const ids = [...new Set(comments.map(c => String(c.confessionId)))];
+            const confessions = ids.length
+                ? await Confession.find({ _id: { $in: ids } }).select('text')
+                : [];
+            const texts = new Map(confessions.map(c => [String(c._id), c.text]));
+
+            return {
+                success: true,
+                total,
+                comments: comments.map(c => ({
+                    ...c.toSafeObject(),
+                    confessionText: texts.get(String(c.confessionId)) || null
+                }))
+            };
+        } catch (error) {
+            logger.error('Error fetching author comments:', error);
+            return { success: false, total: 0, comments: [] };
+        }
+    }
+
+    // { confessionId: commentCount } for a set of confessions.
+    async getCommentCounts(confessionIds = []) {
+        try {
+            if (!databaseConnection.isConnected) await this.initialize();
+
+            const ids = [...new Set(confessionIds.map(String))]
+                .filter(id => mongoose.Types.ObjectId.isValid(id))
+                .map(id => new mongoose.Types.ObjectId(id));
+            if (!ids.length) return { success: true, counts: {} };
+
+            const rows = await Comment.aggregate([
+                { $match: { confessionId: { $in: ids } } },
+                { $group: { _id: '$confessionId', n: { $sum: 1 } } }
+            ]);
+
+            const counts = {};
+            for (const row of rows) counts[String(row._id)] = row.n;
+            return { success: true, counts };
+        } catch (error) {
+            logger.error('Error counting comments:', error);
+            return { success: false, counts: {} };
+        }
+    }
+
+    // Everything the "My Activity" screen shows, in one round trip.
+    async getAuthorActivity(authorId) {
+        try {
+            if (!databaseConnection.isConnected) await this.initialize();
+
+            const id = String(authorId);
+            const [submitted, approved, pending, rejected, comments, replies, own] = await Promise.all([
+                Confession.countDocuments({ authorId: id }),
+                Confession.countDocuments({ authorId: id, status: STATUS.APPROVED }),
+                Confession.countDocuments({ authorId: id, status: STATUS.PENDING }),
+                Confession.countDocuments({ authorId: id, status: STATUS.REJECTED }),
+                Comment.countDocuments({ authorId: id, parentCommentId: null }),
+                Comment.countDocuments({ authorId: id, parentCommentId: { $ne: null } }),
+                Comment.find({ authorId: id }).select('reactions')
+            ]);
+
+            const reactions = own.reduce((sum, comment) => {
+                const store = comment.reactions || {};
+                return sum + ['heart', 'laugh', 'fire', 'like']
+                    .reduce((inner, key) => inner + ((store[key] || []).length), 0);
+            }, 0);
+
+            return { success: true, submitted, approved, pending, rejected, comments, replies, reactions };
+        } catch (error) {
+            logger.error('Error fetching author activity:', error);
+            return { success: false, submitted: 0, approved: 0, pending: 0, rejected: 0, comments: 0, replies: 0, reactions: 0 };
+        }
+    }
+
+    // Numbers for the admin "User Statistics" screen.
+    async getUserStats() {
+        try {
+            if (!databaseConnection.isConnected) await this.initialize();
+
+            const [users, nicknames, comments] = await Promise.all([
+                User.countDocuments(),
+                User.countDocuments({ nickname: { $ne: null } }),
+                Comment.countDocuments()
+            ]);
+
+            const perAuthor = await Confession.aggregate([
+                { $match: { authorId: { $ne: null } } },
+                { $group: { _id: '$authorId', n: { $sum: 1 } } },
+                { $sort: { n: -1 } }
+            ]);
+
+            const reactionAgg = await Comment.aggregate([
+                {
+                    $project: {
+                        heart: { $size: { $ifNull: ['$reactions.heart', []] } },
+                        laugh: { $size: { $ifNull: ['$reactions.laugh', []] } },
+                        fire: { $size: { $ifNull: ['$reactions.fire', []] } },
+                        like: { $size: { $ifNull: ['$reactions.like', []] } }
+                    }
+                },
+                { $group: { _id: null, total: { $sum: { $add: ['$heart', '$laugh', '$fire', '$like'] } } } }
+            ]);
+
+            const totalAuthored = perAuthor.reduce((sum, row) => sum + row.n, 0);
+            const average = perAuthor.length ? (totalAuthored / perAuthor.length).toFixed(1) : '0';
+
+            const top = perAuthor.slice(0, 5);
+            const topUsers = top.length
+                ? await User.find({ telegramId: { $in: top.map(row => String(row._id)) } }).select('telegramId nickname')
+                : [];
+            const nickById = new Map(topUsers.map(u => [String(u.telegramId), u.nickname]));
+
+            return {
+                success: true,
+                users,
+                nicknames,
+                comments,
+                reactions: (reactionAgg[0] && reactionAgg[0].total) || 0,
+                average,
+                top: top.map((row, i) => ({
+                    rank: i + 1,
+                    name: nickById.get(String(row._id)) || `Anon #${i + 1}`,
+                    count: row.n
+                }))
+            };
+        } catch (error) {
+            logger.error('Error fetching user stats:', error);
+            return { success: false, users: 0, nicknames: 0, comments: 0, reactions: 0, average: '0', top: [] };
         }
     }
 
